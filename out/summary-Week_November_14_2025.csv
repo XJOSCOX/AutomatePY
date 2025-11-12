@@ -1,0 +1,3 @@
+email,hoursWorked,onTime%,status
+john.doe@example.com,39.5,100%,WARN
+jane.smith@example.com,42.0,80%,PASS

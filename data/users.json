@@ -5,8 +5,10 @@
     "firstName": "John",
     "lastName": "Doe",
     "department": "Engineering",
-    "role": "Developer",
-    "hoursWorked": 38.5,
+    "role": "Staff",
+    "hireDate": "2022-06-15",
+    "majorIssues": 0,
+    "tier": 1,
     "active": true
   },
   {
@@ -15,8 +17,10 @@
     "firstName": "Jane",
     "lastName": "Smith",
     "department": "Operations",
-    "role": "PM",
-    "hoursWorked": 42.0,
+    "role": "Senior",
+    "hireDate": "2024-03-01",
+    "majorIssues": 0,
+    "tier": 1,
     "active": true
   }
 ]
