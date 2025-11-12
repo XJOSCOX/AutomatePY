@@ -1,0 +1,22 @@
+[
+  {
+    "email": "john.doe@example.com",
+    "employeeNum": "E-1001",
+    "firstName": "John",
+    "lastName": "Doe",
+    "department": "Engineering",
+    "role": "Developer",
+    "hoursWorked": 38.5,
+    "active": true
+  },
+  {
+    "email": "jane.smith@example.com",
+    "employeeNum": "E-1002",
+    "firstName": "Jane",
+    "lastName": "Smith",
+    "department": "Operations",
+    "role": "PM",
+    "hoursWorked": 42.0,
+    "active": true
+  }
+]

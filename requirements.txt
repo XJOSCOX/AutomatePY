@@ -1,0 +1,14 @@
+pandas
+SQLAlchemy
+psycopg2-binary        # for PostgreSQL (use pyodbc for SQL Server)
+python-dotenv
+schedule
+
+
+# If using SQL Server instead of PostgreSQL:
+
+pyodbc
+SQLAlchemy
+pandas
+python-dotenv
+schedule

@@ -1,0 +1,3 @@
+email,employeeNum,firstName,lastName,department,role,hoursWorked,active
+john.doe@example.com,E-1001,John,Doe,Engineering,Developer,38.5,True
+jane.smith@example.com,E-1002,Jane,Smith,Operations,PM,42.0,True
