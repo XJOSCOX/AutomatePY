@@ -1,0 +1,9 @@
+id,weekKey,weekStart,weekEnd,email,hoursWorked,onTimeRatio,lateCount,majorIssues,createdAt,employeeNum,firstName,lastName,department,role,tier,hireDate,empMajorIssues,active,hoursTotal,totalWeeks,weeksOnTime,empUpdatedAt
+8,Week October 27 2025,2025-10-27,2025-11-02,jane.smith@example.com,37.5,0.8,1,0,2025-11-12 12:08:49,E-1002,Jane,Smith,Operations,Senior,1,2023-10-01,0,1,161.5,4,1,2025-11-12 12:08:49
+7,Week October 27 2025,2025-10-27,2025-11-02,john.doe@example.com,40.0,1.0,0,0,2025-11-12 12:08:49,E-1001,John,Doe,Engineering,Senior,2,2022-06-15,0,1,160.0,4,4,2025-11-12 12:08:49
+6,Week November 3 2025,2025-11-03,2025-11-09,jane.smith@example.com,40.0,1.0,0,0,2025-11-12 12:08:49,E-1002,Jane,Smith,Operations,Senior,1,2023-10-01,0,1,161.5,4,1,2025-11-12 12:08:49
+5,Week November 3 2025,2025-11-03,2025-11-09,john.doe@example.com,41.0,1.0,0,0,2025-11-12 12:08:49,E-1001,John,Doe,Engineering,Senior,2,2022-06-15,0,1,160.0,4,4,2025-11-12 12:08:49
+2,Week November 10 2025,2025-11-10,2025-11-16,jane.smith@example.com,42.0,0.8,1,0,2025-11-12 12:08:49,E-1002,Jane,Smith,Operations,Senior,1,2023-10-01,0,1,161.5,4,1,2025-11-12 12:08:49
+4,Week November 14 2025,2025-11-10,2025-11-16,jane.smith@example.com,42.0,0.8,1,0,2025-11-12 12:08:49,E-1002,Jane,Smith,Operations,Senior,1,2023-10-01,0,1,161.5,4,1,2025-11-12 12:08:49
+1,Week November 10 2025,2025-11-10,2025-11-16,john.doe@example.com,39.5,1.0,0,0,2025-11-12 12:08:49,E-1001,John,Doe,Engineering,Senior,2,2022-06-15,0,1,160.0,4,4,2025-11-12 12:08:49
+3,Week November 14 2025,2025-11-10,2025-11-16,john.doe@example.com,39.5,1.0,0,0,2025-11-12 12:08:49,E-1001,John,Doe,Engineering,Senior,2,2022-06-15,0,1,160.0,4,4,2025-11-12 12:08:49

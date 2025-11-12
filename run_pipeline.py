@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-# Manual pipeline: upsert users, process ONLY not-yet-processed weeks, recompute aggregates,
-# run promotions, write weekly + overtime CSVs, and log a PIPELINE run.
+# Manual pipeline: upsert users, process ONLY not-yet-processed weeks (oldest→newest),
+# recompute aggregates SINCE HIRE, run promotions, write weekly + overtime CSVs,
+# and export FULL DB tables to CSV. No external deps; SQLite only.
 
 import os, json, csv, sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# ---------- Paths / constants ----------
 ROOT = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(ROOT, "employees.sqlite3")
 DATA_USERS = os.path.join(ROOT, "data", "users.json")
@@ -17,6 +19,7 @@ CENTRAL_TZ = ZoneInfo("America/Chicago")
 TIER_MAX = 3
 ROLE_BY_TIER = {1: "Staff", 2: "Senior", 3: "Lead"}  # adjust as desired
 
+# ---------- DB schema ----------
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 
@@ -32,9 +35,9 @@ CREATE TABLE IF NOT EXISTS employees (
   majorIssues INTEGER DEFAULT 0,
   active INTEGER DEFAULT 1,
 
-  hoursTotal REAL DEFAULT 0,
-  totalWeeks INTEGER DEFAULT 0,
-  weeksOnTime INTEGER DEFAULT 0,
+  hoursTotal REAL DEFAULT 0,     -- SINCE HIRE (recomputed)
+  totalWeeks INTEGER DEFAULT 0,  -- SINCE HIRE (recomputed)
+  weeksOnTime INTEGER DEFAULT 0, -- SINCE HIRE (recomputed)
 
   updatedAt TEXT DEFAULT (datetime('now'))
 );
@@ -42,7 +45,7 @@ CREATE TABLE IF NOT EXISTS employees (
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   type TEXT NOT NULL,           -- PIPELINE
-  weekKey TEXT,                 -- current ISO week when pipeline was invoked
+  weekKey TEXT,                 -- ISO week when this run was invoked
   startedAt TEXT NOT NULL,
   finishedAt TEXT,
   info TEXT,
@@ -65,9 +68,6 @@ CREATE TABLE IF NOT EXISTS weekly_attendance (
   majorIssues INTEGER DEFAULT 0,
   createdAt TEXT DEFAULT (datetime('now'))
 );
--- unique per (weekKey, email) for dedupe safety
-CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_attendance_unique
-ON weekly_attendance(weekKey, email);
 
 CREATE TABLE IF NOT EXISTS promotion_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS promotion_log (
   createdAt TEXT DEFAULT (datetime('now'))
 );
 
--- NEW: marks a week as fully processed once (primary guard)
+-- Guard that marks a week as fully processed by the pipeline
 CREATE TABLE IF NOT EXISTS processed_weeks (
   weekKey TEXT PRIMARY KEY,
   processedAt TEXT NOT NULL,
@@ -86,15 +86,42 @@ CREATE TABLE IF NOT EXISTS processed_weeks (
 );
 """
 
+# ---------- DB helpers ----------
 def connect():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
+def dedupe_weekly_attendance(conn):
+    """Keep the most recent row per (weekKey,email); delete older duplicates."""
+    with conn:
+        conn.execute("""
+        DELETE FROM weekly_attendance
+        WHERE id NOT IN (
+          SELECT MAX(id) FROM weekly_attendance GROUP BY weekKey, email
+        );
+        """)
+
 def init_db(conn):
+    # Create tables first
     with conn:
         conn.executescript(SCHEMA)
+    # Ensure unique index; auto-dedupe if needed
+    try:
+        with conn:
+            conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_attendance_unique
+            ON weekly_attendance(weekKey, email);
+            """)
+    except sqlite3.IntegrityError:
+        dedupe_weekly_attendance(conn)
+        with conn:
+            conn.execute("DROP INDEX IF EXISTS idx_weekly_attendance_unique;")
+            conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_attendance_unique
+            ON weekly_attendance(weekKey, email);
+            """)
 
 def now_ct_str():
     return datetime.now(tz=CENTRAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -131,9 +158,11 @@ def finish_run(conn, run_id, i=0, u=0, r=0, a=0, p=0):
             (now_ct_str(), i, u, r, a, p, run_id)
         )
 
-# ---------- processed_weeks helpers ----------
+# ---------- processed_weeks ----------
 def is_week_processed(conn, week_key: str) -> bool:
-    row = conn.execute("SELECT 1 FROM processed_weeks WHERE weekKey=?", (week_key,)).fetchone()
+    row = conn.execute(
+        "SELECT 1 FROM processed_weeks WHERE weekKey=?", (week_key,)
+    ).fetchone()
     return row is not None
 
 def mark_week_processed(conn, week_key: str, run_id: int):
@@ -186,7 +215,7 @@ def upsert_users(conn, users):
             print(f"🆕 User inserted: {email}")
     return inserted, updated, rejected
 
-# ---------- Weeks processing ----------
+# ---------- Week helpers ----------
 def derive_week_key_from_payload(wk_payload) -> str:
     if wk_payload.get("weekKey"):
         return wk_payload["weekKey"]
@@ -263,24 +292,52 @@ def process_one_week(conn, wk_payload, csv_week_key_fallback) -> tuple:
 
     return affected, rejected, weekKey, csv_path
 
+# ---------- Aggregates SINCE HIRE ----------
 def recompute_employee_aggregates(conn):
+    """
+    Recompute hoursTotal, totalWeeks, weeksOnTime using ONLY weeks on/after hireDate.
+    If an employee has no hireDate, we count all their weeks.
+    """
     with conn:
         conn.execute("UPDATE employees SET hoursTotal=0, totalWeeks=0, weeksOnTime=0;")
+
     rows = conn.execute("""
-        SELECT email,
-               SUM(hoursWorked) AS hsum,
-               COUNT(*)         AS wcount,
-               SUM(CASE WHEN onTimeRatio >= 0.90 THEN 1 ELSE 0 END) AS w_on_time
-          FROM weekly_attendance
-         GROUP BY email
+        SELECT
+            e.email,
+            COALESCE(SUM(CASE
+                WHEN e.hireDate IS NULL THEN wa.hoursWorked
+                WHEN wa.weekStart IS NOT NULL AND wa.weekStart >= e.hireDate THEN wa.hoursWorked
+                WHEN wa.weekStart IS NULL AND wa.weekEnd   IS NOT NULL AND wa.weekEnd   >= e.hireDate THEN wa.hoursWorked
+                ELSE 0
+            END), 0.0) AS hours_since_hire,
+
+            COALESCE(SUM(CASE
+                WHEN e.hireDate IS NULL THEN 1
+                WHEN wa.weekStart IS NOT NULL AND wa.weekStart >= e.hireDate THEN 1
+                WHEN wa.weekStart IS NULL AND wa.weekEnd   IS NOT NULL AND wa.weekEnd   >= e.hireDate THEN 1
+                ELSE 0
+            END), 0) AS weeks_since_hire,
+
+            COALESCE(SUM(CASE
+                WHEN (e.hireDate IS NULL AND wa.onTimeRatio >= 0.90) THEN 1
+                WHEN (wa.weekStart IS NOT NULL AND wa.weekStart >= e.hireDate AND wa.onTimeRatio >= 0.90) THEN 1
+                WHEN (wa.weekStart IS NULL AND wa.weekEnd   IS NOT NULL AND wa.weekEnd   >= e.hireDate AND wa.onTimeRatio >= 0.90) THEN 1
+                ELSE 0
+            END), 0) AS weeks_on_time_since_hire
+
+        FROM employees e
+        LEFT JOIN weekly_attendance wa
+               ON wa.email = e.email
+        GROUP BY e.email
     """).fetchall()
+
     with conn:
-        for email, hsum, wcount, w_on_time in rows:
+        for email, hsum, wcount, won in rows:
             conn.execute("""
                 UPDATE employees
                    SET hoursTotal=?, totalWeeks=?, weeksOnTime=?, updatedAt=datetime('now')
                  WHERE email=?
-            """, (hsum or 0.0, wcount or 0, w_on_time or 0, email))
+            """, (round(hsum or 0.0, 2), int(wcount or 0), int(won or 0), email))
 
 # ---------- Promotions ----------
 def eligible_for_promo(hireDate: str, majorIssues: int, weeksOnTime: int, totalWeeks: int) -> bool:
@@ -319,27 +376,116 @@ def run_promotions(conn) -> int:
         print("🏅 Promotions: none this run")
     return promoted
 
-# ---------- Overtime CSV ----------
+# ---------- Overtime CSV (cumulative SINCE HIRE) ----------
 def write_overtime_csv(conn):
+    """
+    Write a full history CSV including a cumulative HoursSinceHire column.
+    Cumulative sum excludes weeks before hireDate (if set).
+    """
     ensure_out()
     out_path = os.path.join(OUT_DIR, "performance_overtime.csv")
+
     rows = conn.execute("""
-        SELECT weekKey, email, hoursWorked, onTimeRatio,
-               CASE
-                 WHEN hoursWorked=0 THEN 'FAIL'
-                 WHEN hoursWorked < 40 THEN 'WARN'
-                 ELSE 'PASS'
-               END AS status
-          FROM weekly_attendance
-         ORDER BY weekKey, email
+        WITH base AS (
+          SELECT
+            e.email,
+            e.hireDate,
+            wa.weekKey,
+            COALESCE(wa.weekStart, wa.weekEnd) AS weekDate,
+            wa.hoursWorked,
+            wa.onTimeRatio,
+            CASE
+              WHEN e.hireDate IS NULL THEN 1
+              WHEN COALESCE(wa.weekStart, wa.weekEnd) >= e.hireDate THEN 1
+              ELSE 0
+            END AS include_since_hire
+          FROM weekly_attendance wa
+          JOIN employees e ON e.email = wa.email
+        ),
+        filtered AS (
+          SELECT
+            email, hireDate, weekKey, weekDate, hoursWorked, onTimeRatio,
+            CASE WHEN include_since_hire = 1 THEN hoursWorked ELSE 0 END AS hours_for_cum
+          FROM base
+        ),
+        ranked AS (
+          SELECT
+            email, hireDate, weekKey, weekDate, hoursWorked, onTimeRatio, hours_for_cum,
+            SUM(hours_for_cum) OVER (
+              PARTITION BY email
+              ORDER BY date(weekDate) ASC, weekKey ASC
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS cumulativeHoursSinceHire
+          FROM filtered
+        )
+        SELECT
+          weekKey, email,
+          ROUND(hoursWorked, 2) AS hoursWorked,
+          onTimeRatio,
+          ROUND(cumulativeHoursSinceHire, 2) AS cumulativeHoursSinceHire
+        FROM ranked
+        ORDER BY date(weekDate) ASC, email ASC;
     """).fetchall()
+
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["weekKey","email","hoursWorked","onTime%","status"])
-        for wk, email, hrs, r, status in rows:
-            w.writerow([wk, email, round(hrs or 0.0, 2), f"{int((r or 0)*100)}%", status])
+        w.writerow(["weekKey","email","hoursWorked","onTime%","cumulativeHoursSinceHire","status"])
+        for wk, email, hrs, ratio, cum in rows:
+            status = "FAIL" if (hrs or 0.0) == 0 else ("WARN" if (hrs or 0.0) < 40 else "PASS")
+            w.writerow([wk, email, hrs, f"{int((ratio or 0)*100)}%", cum, status])
+
     print(f"📈 Overtime CSV saved: {out_path}")
     return out_path
+
+# ---------- FULL DB → CSV dumps ----------
+def dump_table_to_csv(conn, table_name: str, out_filename: str):
+    ensure_out()
+    out_path = os.path.join(OUT_DIR, out_filename)
+    cur = conn.cursor()
+    rows = cur.execute(f"SELECT * FROM {table_name};").fetchall()
+    cols = [d[0] for d in cur.description] if cur.description else []
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if cols: w.writerow(cols)
+        for r in rows: w.writerow(r)
+    print(f"🗃️  Dumped {table_name} → {out_path}")
+
+def dump_denormalized_weekly_with_employee(conn):
+    """
+    Join weekly_attendance with employees to include current employee attributes
+    alongside each weekly row.
+    """
+    ensure_out()
+    out_path = os.path.join(OUT_DIR, "weekly_with_employee.csv")
+    cur = conn.cursor()
+    rows = cur.execute("""
+        SELECT
+          wa.id, wa.weekKey, wa.weekStart, wa.weekEnd, wa.email,
+          wa.hoursWorked, wa.onTimeRatio, wa.lateCount, wa.majorIssues, wa.createdAt,
+          e.employeeNum, e.firstName, e.lastName, e.department, e.role, e.tier,
+          e.hireDate, e.majorIssues AS empMajorIssues, e.active,
+          e.hoursTotal, e.totalWeeks, e.weeksOnTime, e.updatedAt AS empUpdatedAt
+        FROM weekly_attendance wa
+        JOIN employees e ON e.email = wa.email
+        ORDER BY date(COALESCE(wa.weekStart, wa.weekEnd)) ASC, wa.email ASC;
+    """).fetchall()
+    cols = [d[0] for d in cur.description]
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows: w.writerow(r)
+    print(f"🧩 Denormalized weekly+employee → {out_path}")
+
+def export_all_csvs(conn):
+    """
+    Export every table + a denormalized join. Call at end of pipeline.
+    """
+    dump_table_to_csv(conn, "employees", "employees.csv")
+    dump_table_to_csv(conn, "weekly_attendance", "weekly_attendance.csv")
+    dump_table_to_csv(conn, "promotion_log", "promotion_log.csv")
+    dump_table_to_csv(conn, "processed_weeks", "processed_weeks.csv")
+    dump_table_to_csv(conn, "runs", "runs.csv")
+    dump_denormalized_weekly_with_employee(conn)
 
 # ---------- Main ----------
 def main():
@@ -364,7 +510,6 @@ def main():
                     payload = load_json(full)
                 except Exception:
                     continue
-                # compute the weekKey we would use
                 wk_key = derive_week_key_from_payload(payload)
                 if not wk_key and payload.get("weekStart"):
                     try:
@@ -373,13 +518,9 @@ def main():
                     except Exception:
                         pass
                 if not wk_key:
-                    # last resort: sort by mtime; we'll compute fallback later
                     wk_key = f"mtime-{int(os.path.getmtime(full))}"
-
                 week_files.append((wk_key, os.path.getmtime(full), full))
-
-        # sort ascending so we process old weeks first
-        week_files.sort(key=lambda x: (x[0], x[1]))
+        week_files.sort(key=lambda x: (x[0], x[1]))  # oldest first
 
     total_affected = 0
     total_rejected = rej_users
@@ -388,12 +529,11 @@ def main():
     last_csv_for_current = None
 
     for wk_key, _, wfile in week_files:
-        # If this entry is an mtime-sentinel, we still need a proper key from payload
         payload = load_json(wfile)
         fallback = current_week_key
         computed_key = derive_week_key_from_payload(payload) or fallback
 
-        # HARD CHECK: if week already processed, skip completely
+        # Skip if already processed
         if is_week_processed(conn, computed_key):
             print(f"⏭️  Week already processed → {computed_key} (skip)")
             skipped_weeks.append(computed_key)
@@ -404,20 +544,23 @@ def main():
         total_rejected += rej
         processed_weeks.append(effective_wk_key)
 
-        # mark the week as processed
+        # Mark as processed
         mark_week_processed(conn, effective_wk_key, run_id)
 
         if effective_wk_key == current_week_key:
             last_csv_for_current = csv_path
 
-    # 3) Recompute aggregates
+    # 3) Recompute aggregates (SINCE HIRE)
     recompute_employee_aggregates(conn)
 
     # 4) Promotions
     promoted = run_promotions(conn)
 
-    # 5) Overtime CSV (all weeks)
+    # 5) Overtime CSV (all weeks; cumulative SINCE HIRE)
     overtime_csv = write_overtime_csv(conn)
+
+    # 6) FULL DB → CSV dumps (+ denormalized weekly+employee)
+    export_all_csvs(conn)
 
     # Finish run log
     finish_run(conn, run_id, i=ins, u=upd, r=total_rejected, a=total_affected, p=promoted)
@@ -435,6 +578,7 @@ def main():
     if last_csv_for_current:
         print(f"   this-week CSV: {last_csv_for_current}")
     print(f"   overtime CSV: {overtime_csv}")
+    print("   full dumps: employees.csv, weekly_attendance.csv, promotion_log.csv, processed_weeks.csv, runs.csv, weekly_with_employee.csv")
 
 if __name__ == "__main__":
     main()

@@ -1,9 +1,9 @@
-weekKey,email,hoursWorked,onTime%,status
-Week November 10 2025,jane.smith@example.com,42.0,80%,PASS
-Week November 10 2025,john.doe@example.com,39.5,100%,WARN
-Week November 14 2025,jane.smith@example.com,42.0,80%,PASS
-Week November 14 2025,john.doe@example.com,39.5,100%,WARN
-Week November 3 2025,jane.smith@example.com,40.0,100%,PASS
-Week November 3 2025,john.doe@example.com,41.0,100%,PASS
-Week October 27 2025,jane.smith@example.com,37.5,80%,WARN
-Week October 27 2025,john.doe@example.com,40.0,100%,PASS
+weekKey,email,hoursWorked,onTime%,cumulativeHoursSinceHire,status
+Week October 27 2025,jane.smith@example.com,37.5,80%,37.5,WARN
+Week October 27 2025,john.doe@example.com,40.0,100%,40.0,PASS
+Week November 3 2025,jane.smith@example.com,40.0,100%,77.5,PASS
+Week November 3 2025,john.doe@example.com,41.0,100%,81.0,PASS
+Week November 10 2025,jane.smith@example.com,42.0,80%,119.5,PASS
+Week November 14 2025,jane.smith@example.com,42.0,80%,161.5,PASS
+Week November 10 2025,john.doe@example.com,39.5,100%,120.5,WARN
+Week November 14 2025,john.doe@example.com,39.5,100%,160.0,WARN

@@ -1,0 +1,2 @@
+id,email,fromTier,toTier,reason,createdAt
+1,john.doe@example.com,1,2,"2y tenure, 0 major issues, ≥90% on-time",2025-11-12 12:08:49
