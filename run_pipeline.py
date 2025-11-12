@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Manual pipeline: upsert users, process current week, promotions, write CSV, log run
+# Manual pipeline: upsert users, process ONLY not-yet-processed weeks, recompute aggregates,
+# run promotions, write weekly + overtime CSVs, and log a PIPELINE run.
 
 import os, json, csv, sqlite3
 from datetime import datetime, timedelta
@@ -14,7 +15,7 @@ OUT_DIR = os.path.join(ROOT, "out")
 EXPECTED_HOURS_DEFAULT = 40.0
 CENTRAL_TZ = ZoneInfo("America/Chicago")
 TIER_MAX = 3
-ROLE_BY_TIER = {1: "Staff", 2: "Senior", 3: "Lead"}  # adjust as you wish
+ROLE_BY_TIER = {1: "Staff", 2: "Senior", 3: "Lead"}  # adjust as desired
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -41,7 +42,7 @@ CREATE TABLE IF NOT EXISTS employees (
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   type TEXT NOT NULL,           -- PIPELINE
-  weekKey TEXT,                 -- e.g., 2025-W46
+  weekKey TEXT,                 -- current ISO week when pipeline was invoked
   startedAt TEXT NOT NULL,
   finishedAt TEXT,
   info TEXT,
@@ -59,11 +60,14 @@ CREATE TABLE IF NOT EXISTS weekly_attendance (
   weekEnd TEXT,
   email TEXT NOT NULL,
   hoursWorked REAL NOT NULL,
-  onTimeRatio REAL NOT NULL,
+  onTimeRatio REAL NOT NULL,    -- 0..1
   lateCount INTEGER DEFAULT 0,
   majorIssues INTEGER DEFAULT 0,
   createdAt TEXT DEFAULT (datetime('now'))
 );
+-- unique per (weekKey, email) for dedupe safety
+CREATE UNIQUE INDEX IF NOT EXISTS idx_weekly_attendance_unique
+ON weekly_attendance(weekKey, email);
 
 CREATE TABLE IF NOT EXISTS promotion_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +76,13 @@ CREATE TABLE IF NOT EXISTS promotion_log (
   toTier INTEGER NOT NULL,
   reason TEXT,
   createdAt TEXT DEFAULT (datetime('now'))
+);
+
+-- NEW: marks a week as fully processed once (primary guard)
+CREATE TABLE IF NOT EXISTS processed_weeks (
+  weekKey TEXT PRIMARY KEY,
+  processedAt TEXT NOT NULL,
+  runId INTEGER
 );
 """
 
@@ -85,26 +96,16 @@ def init_db(conn):
     with conn:
         conn.executescript(SCHEMA)
 
-def now_central_str():
+def now_ct_str():
     return datetime.now(tz=CENTRAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def iso_week_key(dt: datetime) -> str:
-    iso = dt.isocalendar()  # (year, week, weekday)
-    return f"{iso[0]}-W{iso[1]:02d}"
+    y, w, _ = dt.isocalendar()
+    return f"{y}-W{w:02d}"
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-def newest_week_file():
-    # If a file for "current" week exists use it; else fallback to newest Week*.json
-    if not os.path.isdir(WEEKS_DIR):
-        return None
-    files = [os.path.join(WEEKS_DIR, f) for f in os.listdir(WEEKS_DIR) if f.lower().endswith(".json")]
-    if not files:
-        return None
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return files[0]
 
 def ensure_out():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -118,7 +119,7 @@ def start_run(conn, week_key: str):
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO runs (type, weekKey, startedAt, info) VALUES (?, ?, ?, ?)",
-        ("PIPELINE", week_key, now_central_str(), "manual pipeline")
+        ("PIPELINE", week_key, now_ct_str(), "manual pipeline (new weeks only)")
     )
     conn.commit()
     return cur.lastrowid
@@ -127,9 +128,22 @@ def finish_run(conn, run_id, i=0, u=0, r=0, a=0, p=0):
     with conn:
         conn.execute(
             "UPDATE runs SET finishedAt=?, inserted=?, updated=?, rejected=?, affected=?, promoted=? WHERE id=?",
-            (now_central_str(), i, u, r, a, p, run_id)
+            (now_ct_str(), i, u, r, a, p, run_id)
         )
 
+# ---------- processed_weeks helpers ----------
+def is_week_processed(conn, week_key: str) -> bool:
+    row = conn.execute("SELECT 1 FROM processed_weeks WHERE weekKey=?", (week_key,)).fetchone()
+    return row is not None
+
+def mark_week_processed(conn, week_key: str, run_id: int):
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_weeks (weekKey, processedAt, runId) VALUES (?, ?, ?)",
+            (week_key, now_ct_str(), run_id)
+        )
+
+# ---------- Users (roster) ----------
 def upsert_users(conn, users):
     inserted = updated = rejected = 0
     for u in users:
@@ -138,6 +152,7 @@ def upsert_users(conn, users):
             rejected += 1
             print(f"⚠️  Rejected user (missing fields): {u}")
             continue
+
         employeeNum = (str(u.get("employeeNum","")).strip() or None)
         department  = (str(u.get("department","")).strip() or None)
         role        = (str(u.get("role","")).strip() or "Staff")
@@ -171,13 +186,42 @@ def upsert_users(conn, users):
             print(f"🆕 User inserted: {email}")
     return inserted, updated, rejected
 
-def process_week(conn, week_payload, week_key_for_csv) -> tuple:
-    wk = week_payload
-    weekKey    = wk.get("weekKey") or week_key_for_csv
-    weekStart  = wk.get("weekStart")
-    weekEnd    = wk.get("weekEnd")
-    expected   = float(wk.get("expectedHours", EXPECTED_HOURS_DEFAULT))
-    entries    = wk.get("entries", [])
+# ---------- Weeks processing ----------
+def derive_week_key_from_payload(wk_payload) -> str:
+    if wk_payload.get("weekKey"):
+        return wk_payload["weekKey"]
+    for k in ("weekStart","weekEnd"):
+        if wk_payload.get(k):
+            try:
+                dt = datetime.fromisoformat(wk_payload[k]).replace(tzinfo=CENTRAL_TZ)
+                y, w, _ = dt.isocalendar()
+                return f"{y}-W{w:02d}"
+            except Exception:
+                pass
+    return None
+
+def upsert_week_entry(conn, weekKey, weekStart, weekEnd, email, hours, onTimeRatio, lateCount, majorIssues):
+    with conn:
+        conn.execute("""
+            INSERT INTO weekly_attendance (weekKey, weekStart, weekEnd, email, hoursWorked, onTimeRatio, lateCount, majorIssues)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(weekKey, email) DO UPDATE SET
+              weekStart=excluded.weekStart,
+              weekEnd=excluded.weekEnd,
+              hoursWorked=excluded.hoursWorked,
+              onTimeRatio=excluded.onTimeRatio,
+              lateCount=excluded.lateCount,
+              majorIssues=excluded.majorIssues,
+              createdAt=datetime('now');
+        """, (weekKey, weekStart, weekEnd, email, hours, onTimeRatio, lateCount, majorIssues))
+
+def process_one_week(conn, wk_payload, csv_week_key_fallback) -> tuple:
+    """Insert/Update entries for a single weekly file, return (affected, rejected, weekKey, csv_path)."""
+    weekKey = derive_week_key_from_payload(wk_payload) or csv_week_key_fallback
+    weekStart  = wk_payload.get("weekStart")
+    weekEnd    = wk_payload.get("weekEnd")
+    expected   = float(wk_payload.get("expectedHours", EXPECTED_HOURS_DEFAULT))
+    entries    = wk_payload.get("entries", [])
 
     rows_csv = []
     affected = rejected = 0
@@ -195,72 +239,62 @@ def process_week(conn, week_payload, week_key_for_csv) -> tuple:
             print(f"⚠️  Rejected weekly entry: {e}")
             continue
 
-        onTimeRatio = (onTimeDays / workDays) if workDays > 0 else 0.0
         exists = conn.execute("SELECT 1 FROM employees WHERE email=?", (email,)).fetchone()
         if not exists:
             rejected += 1
             print(f"⚠️  Rejected: employee not found → {email}")
             continue
 
-        with conn:
-            conn.execute("""
-                INSERT INTO weekly_attendance (weekKey, weekStart, weekEnd, email, hoursWorked, onTimeRatio, lateCount, majorIssues)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (weekKey, weekStart, weekEnd, email, hours, onTimeRatio, lateCount, majorIssues))
+        onTimeRatio = (onTimeDays / workDays) if workDays > 0 else 0.0
+        upsert_week_entry(conn, weekKey, weekStart, weekEnd, email, hours, onTimeRatio, lateCount, majorIssues)
 
-        row = conn.execute("""
-            SELECT hoursTotal, totalWeeks, weeksOnTime, majorIssues
-            FROM employees WHERE email=?
-        """, (email,)).fetchone()
-        hoursTotal = (row[0] or 0) + hours
-        totalWeeks = (row[1] or 0) + 1
-        weeksOnTime = (row[2] or 0) + (1 if onTimeRatio >= 0.90 else 0)
-        majorSum = (row[3] or 0) + max(0, majorIssues)
-
-        with conn:
-            conn.execute("""
-                UPDATE employees
-                   SET hoursTotal=?, totalWeeks=?, weeksOnTime=?, majorIssues=?, updatedAt=datetime('now')
-                 WHERE email=?
-            """, (hoursTotal, totalWeeks, weeksOnTime, majorSum, email))
-
-        # status for CSV
-        if hours == 0:
-            status = "FAIL"
-        elif 0 < hours < expected:
-            status = "WARN"
-        else:
-            status = "PASS"
-        rows_csv.append([email, hours, f"{int(onTimeRatio*100)}%", status])
+        status = "FAIL" if hours == 0 else ("WARN" if 0 < hours < expected else "PASS")
+        rows_csv.append([weekKey, email, hours, f"{int(onTimeRatio*100)}%", status])
         affected += 1
-        print(f"🗓️  {email:<30} {hours:5.2f}h on-time={onTimeDays}/{workDays} ({onTimeRatio:.0%}) → {status}")
 
-    # Write CSV summary
+    # write per-week CSV
     ensure_out()
     csv_path = os.path.join(OUT_DIR, f"summary-{weekKey.replace(' ', '_')}.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["email", "hoursWorked", "onTime%", "status"])
+        w.writerow(["weekKey", "email", "hoursWorked", "onTime%", "status"])
         w.writerows(rows_csv)
     print(f"📄 CSV saved: {csv_path}")
 
-    return affected, rejected, csv_path
+    return affected, rejected, weekKey, csv_path
 
-def ensure_out():
-    os.makedirs(OUT_DIR, exist_ok=True)
+def recompute_employee_aggregates(conn):
+    with conn:
+        conn.execute("UPDATE employees SET hoursTotal=0, totalWeeks=0, weeksOnTime=0;")
+    rows = conn.execute("""
+        SELECT email,
+               SUM(hoursWorked) AS hsum,
+               COUNT(*)         AS wcount,
+               SUM(CASE WHEN onTimeRatio >= 0.90 THEN 1 ELSE 0 END) AS w_on_time
+          FROM weekly_attendance
+         GROUP BY email
+    """).fetchall()
+    with conn:
+        for email, hsum, wcount, w_on_time in rows:
+            conn.execute("""
+                UPDATE employees
+                   SET hoursTotal=?, totalWeeks=?, weeksOnTime=?, updatedAt=datetime('now')
+                 WHERE email=?
+            """, (hsum or 0.0, wcount or 0, w_on_time or 0, email))
 
+# ---------- Promotions ----------
 def eligible_for_promo(hireDate: str, majorIssues: int, weeksOnTime: int, totalWeeks: int) -> bool:
     if not hireDate or (majorIssues or 0) > 0 or (totalWeeks or 0) <= 0:
         return False
     try:
-        hired = datetime.fromisoformat(hireDate)
+        hired = datetime.fromisoformat(hireDate).replace(tzinfo=CENTRAL_TZ)
     except Exception:
         return False
-    tenure_ok = (datetime.now(tz=CENTRAL_TZ) - hired.replace(tzinfo=CENTRAL_TZ)) >= timedelta(days=365*2)
+    tenure_ok = (datetime.now(tz=CENTRAL_TZ) - hired) >= timedelta(days=365*2)
     on_time_ratio = (weeksOnTime / totalWeeks) if totalWeeks else 0
     return tenure_ok and on_time_ratio >= 0.90
 
-def promotions(conn) -> int:
+def run_promotions(conn) -> int:
     promoted = 0
     rows = conn.execute("""
         SELECT email, tier, role, hireDate, majorIssues, weeksOnTime, totalWeeks
@@ -285,51 +319,122 @@ def promotions(conn) -> int:
         print("🏅 Promotions: none this run")
     return promoted
 
-def already_done_this_week(conn, week_key: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM runs WHERE type='PIPELINE' AND weekKey=? LIMIT 1", (week_key,)
-    ).fetchone()
-    return row is not None
+# ---------- Overtime CSV ----------
+def write_overtime_csv(conn):
+    ensure_out()
+    out_path = os.path.join(OUT_DIR, "performance_overtime.csv")
+    rows = conn.execute("""
+        SELECT weekKey, email, hoursWorked, onTimeRatio,
+               CASE
+                 WHEN hoursWorked=0 THEN 'FAIL'
+                 WHEN hoursWorked < 40 THEN 'WARN'
+                 ELSE 'PASS'
+               END AS status
+          FROM weekly_attendance
+         ORDER BY weekKey, email
+    """).fetchall()
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["weekKey","email","hoursWorked","onTime%","status"])
+        for wk, email, hrs, r, status in rows:
+            w.writerow([wk, email, round(hrs or 0.0, 2), f"{int((r or 0)*100)}%", status])
+    print(f"📈 Overtime CSV saved: {out_path}")
+    return out_path
 
+# ---------- Main ----------
 def main():
-    # Determine our "current week key"
     now_ct = datetime.now(tz=CENTRAL_TZ)
-    week_key = iso_week_key(now_ct)
+    current_week_key = iso_week_key(now_ct)
 
     conn = connect()
     init_db(conn)
+    run_id = start_run(conn, current_week_key)
 
-    # Users
+    # 1) Users roster
     users = load_json(DATA_USERS) if os.path.exists(DATA_USERS) else []
-    run_id = start_run(conn, week_key)
-    ins, upd, rej = upsert_users(conn, users)
+    ins, upd, rej_users = upsert_users(conn, users)
 
-    # Week payload (use newest weeks/*.json)
-    wk_file = newest_week_file()
-    if not wk_file:
-        print("⚠️  No weekly file found in ./weeks — skipping weekly processing.")
-        affected = 0
-        rej_week = 0
-        csv_path = None
-    else:
-        wk_payload = load_json(wk_file)
-        # If weekKey missing in file, we still use our current computed week_key for CSV name
-        affected, rej_week, csv_path = process_week(conn, wk_payload, week_key)
+    # 2) Process ONLY not-yet-processed weeks (oldest → newest)
+    week_files = []
+    if os.path.isdir(WEEKS_DIR):
+        for fname in os.listdir(WEEKS_DIR):
+            if fname.lower().endswith(".json"):
+                full = os.path.join(WEEKS_DIR, fname)
+                try:
+                    payload = load_json(full)
+                except Exception:
+                    continue
+                # compute the weekKey we would use
+                wk_key = derive_week_key_from_payload(payload)
+                if not wk_key and payload.get("weekStart"):
+                    try:
+                        dt = datetime.fromisoformat(payload["weekStart"]).replace(tzinfo=CENTRAL_TZ)
+                        wk_key = iso_week_key(dt)
+                    except Exception:
+                        pass
+                if not wk_key:
+                    # last resort: sort by mtime; we'll compute fallback later
+                    wk_key = f"mtime-{int(os.path.getmtime(full))}"
 
-    # Promotions
-    promoted = promotions(conn)
+                week_files.append((wk_key, os.path.getmtime(full), full))
 
-    # Finish run
-    finish_run(conn, run_id, i=ins, u=upd, r=rej+rej_week, a=affected, p=promoted)
+        # sort ascending so we process old weeks first
+        week_files.sort(key=lambda x: (x[0], x[1]))
+
+    total_affected = 0
+    total_rejected = rej_users
+    skipped_weeks = []
+    processed_weeks = []
+    last_csv_for_current = None
+
+    for wk_key, _, wfile in week_files:
+        # If this entry is an mtime-sentinel, we still need a proper key from payload
+        payload = load_json(wfile)
+        fallback = current_week_key
+        computed_key = derive_week_key_from_payload(payload) or fallback
+
+        # HARD CHECK: if week already processed, skip completely
+        if is_week_processed(conn, computed_key):
+            print(f"⏭️  Week already processed → {computed_key} (skip)")
+            skipped_weeks.append(computed_key)
+            continue
+
+        affected, rej, effective_wk_key, csv_path = process_one_week(conn, payload, csv_week_key_fallback=fallback)
+        total_affected += affected
+        total_rejected += rej
+        processed_weeks.append(effective_wk_key)
+
+        # mark the week as processed
+        mark_week_processed(conn, effective_wk_key, run_id)
+
+        if effective_wk_key == current_week_key:
+            last_csv_for_current = csv_path
+
+    # 3) Recompute aggregates
+    recompute_employee_aggregates(conn)
+
+    # 4) Promotions
+    promoted = run_promotions(conn)
+
+    # 5) Overtime CSV (all weeks)
+    overtime_csv = write_overtime_csv(conn)
+
+    # Finish run log
+    finish_run(conn, run_id, i=ins, u=upd, r=total_rejected, a=total_affected, p=promoted)
     conn.close()
 
-    print("\n✅ PIPELINE DONE")
-    print(f"   week_key: {week_key}")
-    print(f"   users: {ins} inserted, {upd} updated, {rej} rejected")
-    print(f"   weekly affected: {affected}, rejected: {rej+rej_week}")
+    print("\n✅ PIPELINE COMPLETE")
+    print(f"   current week: {current_week_key}")
+    print(f"   users: {ins} inserted, {upd} updated, {rej_users} rejected")
+    print(f"   weekly rows affected: {total_affected}, rejected: {total_rejected - rej_users}")
     print(f"   promoted: {promoted}")
-    if csv_path:
-        print(f"   summary CSV: {csv_path}")
+    if skipped_weeks:
+        print(f"   skipped weeks (already processed): {sorted(set(skipped_weeks))}")
+    if processed_weeks:
+        print(f"   newly processed weeks: {sorted(set(processed_weeks))}")
+    if last_csv_for_current:
+        print(f"   this-week CSV: {last_csv_for_current}")
+    print(f"   overtime CSV: {overtime_csv}")
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,24 @@
+{
+  "weekKey": "Week November 3 2025",
+  "weekStart": "2025-11-03",
+  "weekEnd": "2025-11-09",
+  "expectedHours": 40,
+  "entries": [
+    {
+      "email": "john.doe@example.com",
+      "hoursWorked": 41.0,
+      "onTimeDays": 5,
+      "workDays": 5,
+      "lateCount": 0,
+      "majorIssues": 0
+    },
+    {
+      "email": "jane.smith@example.com",
+      "hoursWorked": 40.0,
+      "onTimeDays": 5,
+      "workDays": 5,
+      "lateCount": 0,
+      "majorIssues": 0
+    }
+  ]
+}

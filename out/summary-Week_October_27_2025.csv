@@ -1,0 +1,3 @@
+weekKey,email,hoursWorked,onTime%,status
+Week October 27 2025,john.doe@example.com,40.0,100%,PASS
+Week October 27 2025,jane.smith@example.com,37.5,80%,WARN
